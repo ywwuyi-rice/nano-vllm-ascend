@@ -1,9 +1,9 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
+from nanovllm.utils.parallel_state import get_tp_group
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -14,8 +14,8 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_group().rank
+        self.tp_size = get_tp_group().size
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
@@ -38,7 +38,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            get_tp_group().all_reduce(y)
         return y
 
 
@@ -61,6 +61,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0)
+            get_tp_group().gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits

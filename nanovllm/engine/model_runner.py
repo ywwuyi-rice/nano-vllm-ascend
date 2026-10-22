@@ -20,9 +20,11 @@ from nanovllm.models.qwen2_5_omni import load_qwen2_5_omni_model
 from nanovllm.utils.context import set_context, reset_context, get_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
+from nanovllm.utils.parallel_state import init_distributed_environment, init_model_parallel, get_tp_group
+
+
 
 logger = init_logger(__name__)
-
 
 class ModelRunner:
 
@@ -37,8 +39,8 @@ class ModelRunner:
         self.device = config.device
         self.model_type = self.hf_config.model_type
 
-        dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
-        torch.npu.set_device(rank)
+        init_distributed_environment(self.world_size, self.rank, config.hccl_port)
+        init_model_parallel(config.tensor_parallel_size, 1)  # TODO: CP 阶段改为 config.context_parallel_size
         default_dtype = torch.get_default_dtype()
 
         torch_dtype = self._set_torch_dtype(self.hf_config)

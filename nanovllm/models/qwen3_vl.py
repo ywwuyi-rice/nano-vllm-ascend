@@ -14,7 +14,6 @@ import math
 from typing import List, Optional, Sequence, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -29,6 +28,7 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.utils.logger import init_logger
+from nanovllm.utils.parallel_state import get_tp_group
 
 logger = init_logger(__name__)
 
@@ -53,7 +53,7 @@ class Qwen3VLTextAttention(nn.Module):
             rope_scaling: tuple | None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_group().size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

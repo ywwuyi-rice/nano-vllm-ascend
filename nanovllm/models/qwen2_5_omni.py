@@ -12,7 +12,6 @@ from __future__ import annotations
 from typing import List, Tuple
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from nanovllm.layers.activation import SiluAndMul
@@ -26,6 +25,7 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rotary_emb_mrope
 from nanovllm.utils.logger import init_logger
+from nanovllm.utils.parallel_state import get_tp_group
 
 logger = init_logger(__name__)
 
@@ -83,7 +83,7 @@ class Qwen2_5OmniTextAttention(nn.Module):
             rope_scaling: tuple | None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_group().size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

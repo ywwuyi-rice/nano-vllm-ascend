@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 from torch import nn
 from transformers import Qwen3MoeConfig
 import torch._dynamo as dynamo
@@ -14,6 +13,7 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.utils.parallel_state import get_tp_group
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -31,7 +31,7 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_group().size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
