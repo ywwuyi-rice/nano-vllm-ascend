@@ -3,13 +3,13 @@
 
 import torch
 from torch import nn
-import torch.distributed as dist
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import NPURMSNorm as RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.parallel_state import get_tp_group
 import math
 
 
@@ -172,7 +172,7 @@ class Cpm4Attention(nn.Module):
             apply_qk_norm: bool = False,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_group().size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

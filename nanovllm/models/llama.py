@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 from torch import nn
 from transformers import LlamaConfig
 
@@ -13,6 +12,7 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope_llama
+from nanovllm.utils.parallel_state import get_tp_group
 
 
 class LlamaAttention(nn.Module):
@@ -31,7 +31,7 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_group().size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
