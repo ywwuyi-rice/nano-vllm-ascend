@@ -33,7 +33,8 @@ class VocabParallelEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor):
         ctx = get_context()
-        if ctx.enable_sp and ctx.is_prefill:
+        sp = self.tp_size > 1 and ctx.enable_sp and ctx.is_prefill
+        if sp:
             start, end = get_tp_group().token_range(ctx.num_tokens)
             x = x[start:end]
         if self.tp_size > 1:
@@ -42,7 +43,11 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            get_tp_group().all_reduce(y)
+            if sp:
+                # 各 rank 行数可能不等（num_tokens 不整除），需先 pad 到 max_len 再归约
+                y = get_tp_group().all_reduce_shard(y, ctx.num_tokens)
+            else:
+                get_tp_group().all_reduce(y)
         return y
 
 
@@ -60,6 +65,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
+            if context.enable_sp:
+                # last_indices 是全局坐标系，必须先恢复完整 T
+                x = get_tp_group().all_gather(x, context.num_tokens)
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)

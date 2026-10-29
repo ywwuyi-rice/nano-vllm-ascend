@@ -80,8 +80,8 @@
 - bias 仍只在 `tp_rank == 0` 加，`reduce_scatter` 内部先 all_reduce，语义不变
 
 ### ✅ B5：embedding / lm_head 端点（已完成，未测）
-- [embed_head.py](../nanovllm/layers/embed_head.py) L34-46 `VocabParallelEmbedding.forward`：SP 时先用 `token_range` 切 `input_ids`，**出口仍保留词表维的 `all_reduce`**（与 token 切分正交，不能换成 reduce_scatter，否则会二次切分）
-- 同文件 L60-66 `ParallelLMHead.forward`：`all_gather` 必须在 `cu_seqlens_q[1:] - 1` 之前，因为该索引是全局坐标系
+- [embed_head.py](../nanovllm/layers/embed_head.py) L34-51 `VocabParallelEmbedding.forward`：SP 时先用 `token_range` 切 `input_ids`，**出口仍保留词表维的 `all_reduce`**（与 token 切分正交，不能换成 reduce_scatter，否则会二次切分）；该归约改走 `all_reduce_shard`——不整除时各 rank 行数不同（4/3、或 T<N 时 0 行），HCCL 要求形状一致，须先 pad 到 `max_len` 再截回本 rank 行数
+- 同文件 L65-72 `ParallelLMHead.forward`：`all_gather` 必须在 `cu_seqlens_q[1:] - 1` 之前，因为该索引是全局坐标系
 - [parallel_state.py](../nanovllm/utils/parallel_state.py) L28 `_token_range` → `token_range`（公开），保证 embedding 切片与 `all_gather`/`reduce_scatter` 使用同一套余数分配
 
 ### ✅ B6：运行时开关（已完成，未测）
@@ -122,17 +122,17 @@
 - SP 只缩小 shard 区（残差流 / RMSNorm 输出），attention 与 MLP 中间量仍在完整 T，不省
 - v1 的 `all_gather` 会临时分配 pad buffer + `cat` 结果（合计约 2×T×H），峰值可能被抵消——**这一步不降，后面调参没有意义**
 
-**第三步：省下的显存如何变现**
+**第三步：省下的显存能换什么**
 
-- 固定 `gpu_memory_utilization`，比较引擎实际开出的 `num_kvcache_blocks`：块数增加 → decode 并发上限提高
-- 若显存允许，再调大 `max_num_batched_tokens`（原值可能正是被激活峰值卡住的），观察 TTFT 与 prefill 吞吐
-- 注意 SP 只是抬高天花板，参数不手动上调不会自动产生收益
+- ⚠️ **换不到更多 KV 块**：`allocate_kv_cache` 在权重加载完、尚未跑任何 forward 时就按当时的 `allocated_bytes.all.peak`（≈ 权重占用）一次性算死 `num_kvcache_blocks`，并覆盖外部传入值。SP 省的是激活，此时还没发生，块数不会因此变化
+- 因此真正可用的变现路径只有一条：**同样的 `max_num_batched_tokens` 下 prefill 峰值更低（余量更大），从而可以把 batched tokens 调得更大而不 OOM**
+- 调大 batched tokens 后 KV 块数不变，运行时更容易 OOM，需同时观察峰值；不要用"块数是否变化"来判断 SP 是否有收益
 
 **第四步：扫参定位适用区**
 
 - 主变量 `max_num_batched_tokens`（4K/8K/16K/32K）× `tensor_parallel_size`（2/4/8），负载必须偏 prefill（长 prompt + 短输出），否则差异淹没在 decode 噪声里
 - 辅助变量 `max_num_seqs`（同样 T 下长序列少请求 vs 短序列多请求）、`kvcache_block_size`
-- 关注三条曲线：prefill 峰值差、TTFT 差、KV 块增量；只有"峰值降 + 块数增 + TTFT 不明显劣化"的组合才值得默认开启
+- 关注两条曲线：prefill 峰值差、同 T 下的 TTFT 差；再找"同一显存预算下能开到的最大 batched tokens"。只有"峰值降 + 可开 T 变大 + TTFT 不明显劣化"的组合才值得默认开启
 - 预期：v1 每层通信量约高于基线 50%（`all_reduce`×2 → `all_gather` + 模拟 `reduce_scatter`），TP 越大摊薄越多；TP=2 + 显存宽松时应无收益
 
 ## 5. 测试要点（ut/test_parallel_state.py，曾全绿，现需有卡环境）
@@ -163,6 +163,9 @@
 13. **`reduce_scatter` 的输入侧不能裁**：通用场景（如 ZeRO 梯度）中每个 rank 必须贡献它对所有分块的 partial；SP 的 Row 出口之所以能"先切后算"，是因为切片维（token）与归约维（hidden）正交，这是 TP 结构给的局部特权，不能下沉为通用原语
 14. **特殊模型必须拦死**：多模态走 `inputs_embeds` 会绕过 `embed_tokens`（入口没切，下游却按 shard 处理）；MoE 的专家循环里 Column gather 后每个 rank 都算出相同 full T 结果，Row 的 all_reduce 会放大 N 倍。两者都在 `config.py` 断言拦截，v2 再谈支持
 15. **索引要区分"坐标系"与"地址"**：`cu_seqlens` / `last_indices` / `positions` 是坐标系，必须与张量同坐标系；`slot_mapping` / `block_tables` 是全局地址，条目顺序跟着同区间切即可。判据：`f(x_full)[s:e] == f(x_full[s:e], meta[s:e])`
+16. **分片上的 `all_reduce` 形状必须一致**：embedding 在 `T/N` 上做词表维归约，不整除时各 rank 行数不同（4/3），HCCL 报错或挂死；T<N 时还会有 rank 拿到 0 行。统一走 `all_reduce_shard`（pad 到 `max_len` → 归约 → 截回）
+17. **`--enforce-eager` 是 `store_true` 且无 default**：argparse 默认给 False，会覆盖 dataclass 的 True，导致 `--enable-sp` 单独使用在 `Config` 断言处失败。已在 `EngineArgs.__post_init__` 里由 `enable_sp` 兜底置 True
+18. **KV 块数在权重加载后就固定**：`allocate_kv_cache` 用当时的 peak（≈权重）计算并覆盖 `num_kvcache_blocks`，SP 省的激活不会转成更多块——别用"块数变化"评价 SP
 
 ## 7. 环境备忘
 

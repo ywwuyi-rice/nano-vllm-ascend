@@ -25,6 +25,10 @@ class EngineArgs:
 
     def __post_init__(self):
         self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
+        # SP 首版依赖 eager（图模式未适配 dist 算子），且 --enforce-eager 是 store_true，
+        # 不显式指定时 argparse 会给 False 覆盖 dataclass 默认的 True，这里兜底
+        if self.enable_sp:
+            self.enforce_eager = True
 
     @staticmethod
     def add_cli_args(
