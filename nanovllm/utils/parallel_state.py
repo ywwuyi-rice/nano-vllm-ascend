@@ -41,17 +41,6 @@ class GroupCoordinator:
         return output_
         
         
-    def all_reduce_shard(self,input_:torch.Tensor,total_len:int) ->torch.Tensor:
-        """对 token 分片求和：total_len 不整除时各 rank 行数不同，先 pad 到 max_len 再截回本 rank。"""
-        if self.size == 1:
-            return input_
-        base, rem = divmod(total_len, self.size)
-        max_len = base + (1 if rem else 0)
-        my_len = input_.shape[0]
-        padded = F.pad(input_, (0, 0, 0, max_len - my_len))
-        self.all_reduce(padded)
-        return padded[:my_len]
-
     def all_gather(self,input_:torch.Tensor,total_len:int) ->torch.Tensor:
         if self.size == 1:
             return input_

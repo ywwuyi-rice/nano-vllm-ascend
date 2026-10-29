@@ -80,8 +80,9 @@
 - bias 仍只在 `tp_rank == 0` 加，`reduce_scatter` 内部先 all_reduce，语义不变
 
 ### ✅ B5：embedding / lm_head 端点（已完成，未测）
-- [embed_head.py](../nanovllm/layers/embed_head.py) L34-51 `VocabParallelEmbedding.forward`：SP 时先用 `token_range` 切 `input_ids`，**出口仍保留词表维的 `all_reduce`**（与 token 切分正交，不能换成 reduce_scatter，否则会二次切分）；该归约改走 `all_reduce_shard`——不整除时各 rank 行数不同（4/3、或 T<N 时 0 行），HCCL 要求形状一致，须先 pad 到 `max_len` 再截回本 rank 行数
-- 同文件 L65-72 `ParallelLMHead.forward`：`all_gather` 必须在 `cu_seqlens_q[1:] - 1` 之前，因为该索引是全局坐标系
+- [embed_head.py](../nanovllm/layers/embed_head.py) L34-47 `VocabParallelEmbedding.forward`：**不能先切 `input_ids`**。词表维 `all_reduce` 按行号把各 rank 的同一行相加，各 rank 必须持同一批 token；先切会让 rank0 的第 i 行（token i）和 rank1 的第 i 行（token T/N+i）相加，得到两个无关 token 之和。因此保持全量 T 算完 `all_reduce`，出口再按 `token_range` 切片并 `.clone()`（视图会拖住全量存储）
+- 成本：入口是"全量计算 + 全量归约（≈2V）"，与 Megatron `reduce_scatter_embeddings` 同思路；v2 换原生 reduce_scatter 可降到 ≈V
+- 同文件 L50-58 `ParallelLMHead.forward`：`all_gather` 必须在 `cu_seqlens_q[1:] - 1` 之前，因为该索引是全局坐标系
 - [parallel_state.py](../nanovllm/utils/parallel_state.py) L28 `_token_range` → `token_range`（公开），保证 embedding 切片与 `all_gather`/`reduce_scatter` 使用同一套余数分配
 
 ### ✅ B6：运行时开关（已完成，未测）
@@ -159,11 +160,11 @@
 9. **`all_gather` 的 `total` 不能从 `input_.shape[0]` 推**：进函数时 input 已是 shard（T/N 行），必须由调用方从 cu_seqlens 传入全网一致的 T
 10. **`reduce_scatter` 要 `.clone()`**：`tensor[start:end]` 是视图，底层仍持有完整 T×H 存储，会抵消 SP 的 activation 显存收益
 11. **`Context` 是位置参数构造**：给 dataclass 插字段后，`Context(is_prefill, cu_seqlens_q, ...)` 会整体后移错位（`cu_seqlens_q` 落进 `enable_sp`），类型不匹配时才会报错，兼容时静默错算。已全部改为关键字构造，后续新增字段务必保持
-12. **embedding 入口不要用 `reduce_scatter`**：`all_reduce`（词表维）与 token 切分正交，先切 `input_ids` 再保留原 `all_reduce`，通信/计算都只有 `1/N`；若改成"全量算完再 reduce_scatter"，要多算 `(N-1)/N` 的废活并抬高峰值
+12. **embedding 绝不能先切 token 再归约**：这里的 `all_reduce` 是词表维、按**行号**对齐求和，各 rank 必须持同一批 token。先切会让 rank0 第 i 行（token i）与 rank1 第 i 行（token T/N+i）相加，两个 rank 拿到同一份错误结果（典型症状：所有序列输出一模一样）。正确做法是全量算 + all_reduce + 出口切片；代价是入口通信 ≈2V，v2 换原生 reduce_scatter 降到 ≈V
 13. **`reduce_scatter` 的输入侧不能裁**：通用场景（如 ZeRO 梯度）中每个 rank 必须贡献它对所有分块的 partial；SP 的 Row 出口之所以能"先切后算"，是因为切片维（token）与归约维（hidden）正交，这是 TP 结构给的局部特权，不能下沉为通用原语
 14. **特殊模型必须拦死**：多模态走 `inputs_embeds` 会绕过 `embed_tokens`（入口没切，下游却按 shard 处理）；MoE 的专家循环里 Column gather 后每个 rank 都算出相同 full T 结果，Row 的 all_reduce 会放大 N 倍。两者都在 `config.py` 断言拦截，v2 再谈支持
 15. **索引要区分"坐标系"与"地址"**：`cu_seqlens` / `last_indices` / `positions` 是坐标系，必须与张量同坐标系；`slot_mapping` / `block_tables` 是全局地址，条目顺序跟着同区间切即可。判据：`f(x_full)[s:e] == f(x_full[s:e], meta[s:e])`
-16. **分片上的 `all_reduce` 形状必须一致**：embedding 在 `T/N` 上做词表维归约，不整除时各 rank 行数不同（4/3），HCCL 报错或挂死；T<N 时还会有 rank 拿到 0 行。统一走 `all_reduce_shard`（pad 到 `max_len` → 归约 → 截回）
+16. **别用 pad 去救"行不对齐"**：曾加过 `all_reduce_shard`（pad 到 `max_len` 再归约）想解决不整除问题，但 pad 只保证**形状**一致，救不了**行语义**——各行本就对应不同 token，补齐后照样是错的。判断标准是"两 rank 的第 i 行是否同一个 token"，不是"形状是否相同"。已删除该方法
 17. **`--enforce-eager` 是 `store_true` 且无 default**：argparse 默认给 False，会覆盖 dataclass 的 True，导致 `--enable-sp` 单独使用在 `Config` 断言处失败。已在 `EngineArgs.__post_init__` 里由 `enable_sp` 兜底置 True
 18. **KV 块数在权重加载后就固定**：`allocate_kv_cache` 用当时的 peak（≈权重）计算并覆盖 `num_kvcache_blocks`，SP 省的激活不会转成更多块——别用"块数变化"评价 SP
 

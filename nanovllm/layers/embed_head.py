@@ -32,22 +32,18 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
-        ctx = get_context()
-        sp = self.tp_size > 1 and ctx.enable_sp and ctx.is_prefill
-        if sp:
-            start, end = get_tp_group().token_range(ctx.num_tokens)
-            x = x[start:end]
+        context = get_context()
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            if sp:
-                # 各 rank 行数可能不等（num_tokens 不整除），需先 pad 到 max_len 再归约
-                y = get_tp_group().all_reduce_shard(y, ctx.num_tokens)
-            else:
-                get_tp_group().all_reduce(y)
+            # 词表维归约按行号对齐，各 rank 必须持同一批 token，所以这里先算全量 T
+            get_tp_group().all_reduce(y)
+        if context.enable_sp and context.is_prefill:
+            start, end = get_tp_group().token_range(context.num_tokens)
+            y = y[start:end].clone()
         return y
 
 
