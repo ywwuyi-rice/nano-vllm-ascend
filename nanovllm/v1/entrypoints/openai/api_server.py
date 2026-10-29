@@ -78,6 +78,9 @@ async def lifespan(app: fastapi.FastAPI):
                             type=int,
                             default=1,
                             help="Tensor parallel size")
+        parser.add_argument("--enable-sp",
+                            action="store_true",
+                            help="Enable sequence parallel (prefill only)")
         parser.add_argument("--hccl-port",
                             type=int,
                             default=28000,
@@ -103,6 +106,7 @@ async def lifespan(app: fastapi.FastAPI):
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
+        enable_sp=args.enable_sp,
         hccl_port=hccl_port,
         enforce_eager=args.enforce_eager,
         log_requests=True,

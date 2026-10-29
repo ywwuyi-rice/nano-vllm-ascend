@@ -314,8 +314,9 @@ class ModelRunner:
                     slot_mapping=slot_mapping,
                     context_lens=None,
                     block_tables=block_tables,
-                    block_size=self.config.kvcache_block_size)
-
+                    block_size=self.config.kvcache_block_size,
+                    enable_sp=self.config.enable_sp,
+                    num_tokens=int(cu_seqlens_q[-1].item()))
         return input_ids, positions
 
     def prepare_decode_padding(self, seqs: list[Sequence]):

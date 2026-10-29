@@ -1,6 +1,8 @@
 # SP / CP 并行特性开发计划
 
-> 状态跟踪文档（用户实现 / AI review 模式）。最后更新：2026-10-22，**A2 已完成，待 A3 NPU 验收**。
+> 状态跟踪文档（用户实现 / AI review 模式）。最后更新：2026-10-29，**A1/A2/B1~B6 代码已完成，待 B2 单测 + A3/B7 有卡环境验收与调参**。
+>
+> 代码状态：SP 全部接线已在本机完成（仅 `py_compile` 通过，无运行时验证）；上一次 push 的基线为 commit `a004f47`。
 
 ## 1. 背景
 
@@ -21,7 +23,7 @@
 
 ### M2：SP（TP×SP，仅 prefill）
 - 原理：`RowParallelLinear` 的 all_reduce → reduce_scatter（token 维切分激活）；Column 并行层前置 all_gather；RMSNorm/attention/rope/MoE router 零改动
-- embedding 的 all_reduce → reduce_scatter；lm_head 前置 all_gather
+- embedding 入口用 `token_range` 切 `input_ids`（保留词表维的 `all_reduce`）；lm_head 入口前置 `all_gather` 以支撑全局 `last_indices`
 - **SP 不需要新建进程组**，复用 TP 组
 - v1 用 all_reduce+slice / gather+cat 模拟（免 padding），后续再优化
 - 通过 `context.is_prefill` 分支，decode 不启用；首版限 `enforce_eager`（torchair fullgraph 捕获 dist 算子单独适配）
@@ -39,7 +41,7 @@
 ### ✅ A1：parallel_state + gloo 测试（已完成）
 - [parallel_state.py](../nanovllm/utils/parallel_state.py) 全部完成：GroupCoordinator（`self.rank`、all_reduce/gather 封装、size==1 短路）、按行/列遍历建组（new_group 集合契约正确）、cp=1 占位组、getter assert
 - [ut/test_parallel_state.py](../ut/test_parallel_state.py) **六用例全绿**（本机 WSL gloo 验证）：2×2 metadata/all_reduce、2×1 退化、2×4、4×2 非方阵布局
-- ⚠️ 测试文件用 importlib bypass 直接按路径加载 parallel_state（绕过 `nanovllm/__init__.py` 的 torch_npu/torchair 导入链，使纯 CPU 环境可跑）。在有 NPU 的环境可直接跑，无需修改
+- ⚠️ 测试文件当前用直接 `from nanovllm...` import，**本机（无 torch_npu）跑不了**，需在有卡环境执行；如需本机跑，可临时改回 importlib 按路径加载
 
 ### ✅ A2：接线（已完成，2026-10-22）
 全部 `dist.get_world_size()/get_rank()` 已替换为 `get_tp_group().size/.rank`：
@@ -49,21 +51,91 @@
 - 6 个模型文件（llama/qwen3/qwen3_moe/mini_cpm4/qwen3_vl/qwen2_5_omni）：各 2 处
 - 验证：残留 `dist.*` 扫描仅剩 parallel_state.py 自身 5 处（合法）；10 文件语法检查通过
 
-### ⏳ A3：NPU 验收（下一步，需有卡环境）
+### ✅ B2：SP 通信原语（已完成，未测）
+[parallel_state.py](../nanovllm/utils/parallel_state.py) 新增：
+
+| 方法 | 实现要点 |
+|---|---|
+| `_token_range(total)` | `base, rem = divmod(total, size)`；`start = rank*base + min(rank, rem)`；余数分给靠前 rank，连续切分 |
+| `reduce_scatter(x)` | `all_reduce(x)` + 本地切片 + **`.clone()`**（避免视图拖住全量 activation） |
+| `all_gather(shard, total)` | `max_len = base + (1 if rem else 0)` → `F.pad` 尾部补齐 → 原生 `all_gather` → 按 `sizes` 截断 → `cat(dim=0)` |
+
+- `total` 必须由调用方传入（进函数时 input 已是 shard，不能反推）
+- `sizes` / 区间全部本地推导，零通信交换元数据
+- 已含 `assert my_len == sizes[self.rank]` 自检
+- ⏳ **缺单测**：gloo 用例需覆盖 T 不整除（T=7, N=2/3）与整除（T=8）
+
+### ✅ B1：开关链路（已完成，未测）
+`--enable-sp` 从 CLI 一路到 `set_context`，四个入口都已打通：
+
+- [config.py](../nanovllm/config.py) L22 加 `enable_sp: bool = False`；L41-47 断言：`tensor_parallel_size > 1`、`enforce_eager == True`、架构名不含 `Moe`、`model_type` 不属于 `{qwen3_vl, qwen2_5_omni}`
+- [arg_utils.py](../nanovllm/utils/arg_utils.py) 加 `enable_sp` 字段与 `--enable-sp/-sp`（argparse 自动映射到 `dest=enable_sp`，`from_cli_args` 无需改动）
+- [api_server.py](../nanovllm/v1/entrypoints/openai/api_server.py) L108 显式传入 `AsyncLLMEngine(enable_sp=args.enable_sp)`（原代码读 `args.enable_sp` 却没传，属静默失效）
+- [bench.py](../bench/bench.py) 的 `LLM(...)` 同样补传
+- 注意：多模态断言不能用 `self.is_multimodal`——它在 `__post_init__` 时仍是 `False`，由 model_runner 事后回填，只能查 `hf_config`
+
+### ✅ B3/B4：线性层接线（已完成，未测）
+- [linear.py](../nanovllm/layers/linear.py) L73-77 `ColumnParallelLinear.forward`：`enable_sp and is_prefill` 时 `all_gather(x, ctx.num_tokens)` 后做 `F.linear`；`MergedColumnParallelLinear` / `QKVParallelLinear` 继承此类，改一处全覆盖
+- 同文件 L153-161 `RowParallelLinear.forward`：SP+prefill 走 `reduce_scatter(y)`，否则维持 `all_reduce(y)`
+- bias 仍只在 `tp_rank == 0` 加，`reduce_scatter` 内部先 all_reduce，语义不变
+
+### ✅ B5：embedding / lm_head 端点（已完成，未测）
+- [embed_head.py](../nanovllm/layers/embed_head.py) L34-46 `VocabParallelEmbedding.forward`：SP 时先用 `token_range` 切 `input_ids`，**出口仍保留词表维的 `all_reduce`**（与 token 切分正交，不能换成 reduce_scatter，否则会二次切分）
+- 同文件 L60-66 `ParallelLMHead.forward`：`all_gather` 必须在 `cu_seqlens_q[1:] - 1` 之前，因为该索引是全局坐标系
+- [parallel_state.py](../nanovllm/utils/parallel_state.py) L28 `_token_range` → `token_range`（公开），保证 embedding 切片与 `all_gather`/`reduce_scatter` 使用同一套余数分配
+
+### ✅ B6：运行时开关（已完成，未测）
+- [context.py](../nanovllm/utils/context.py) L8-9 加 `enable_sp` / `num_tokens`；`set_context` 签名同步，且 `Context(...)` 由**位置参数改为关键字构造**（字段新增导致位置错位是隐藏杀手）
+- [model_runner.py](../nanovllm/engine/model_runner.py) L318-319 prefill 传 `enable_sp` 与 `num_tokens=int(cu_seqlens_q[-1].item())`（只算一次，避免每层 D2H 同步）；decode 两处不传，靠默认 `False` 双保险
+
+
+### ⏳ A3：NPU 验收（需有卡环境）
 1. TP=1 回归：输出与重构前一致（单卡无通信，纯回归）
 2. TP=2 跑 llama（或 qwen3），greedy 输出与重构前**逐 token 一致**
 3. 若不一致，排查顺序：Row/Column 的 tp_rank 语义 → embedding mask 逻辑 → LMHead gather 的全局 rank 翻译
 
-### 4. B：SP 实现（A3 过后）
-1. `config.py` 加 `enable_sp`（默认 False）
-2. GroupCoordinator 加 `all_gather/reduce_scatter`（token 维；v1 用 all_reduce+slice / gather+cat 模拟免 padding）
-3. `RowParallelLinear.forward`：SP+prefill 时 all_reduce → reduce_scatter
-4. Column 系 forward 前置 all_gather（token 维恢复完整序列）
-5. embed_head 同模式改造
-6. 运行时开关借 `context.is_prefill`（decode 不启用）；首版限 enforce_eager
-7. 验收：TP=2+SP vs TP=2 greedy 逐 token 一致 + `torch.npu.memory_stats()` 激活内存对比
+## 4. B：SP 实现计划
 
-## 5. 测试要点（ut/test_parallel_state.py，已验证）
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| B1 | `config.py` 加 `enable_sp`（默认 False）、`arg_utils` 加 CLI | ✅ 完成 |
+| B2 | GroupCoordinator 加 `reduce_scatter` / `all_gather` | ✅ 完成，⏳ 缺单测 |
+| B3 | `RowParallelLinear.forward`：SP+prefill 时 all_reduce → reduce_scatter | ✅ 完成，未测 |
+| B4 | Column 系（qkv/gate_up）forward 前置 all_gather | ✅ 完成，未测 |
+| B5 | embedding 入口切片（保留词表维 all_reduce）；lm_head 前置 all_gather | ✅ 完成，未测 |
+| B6 | 运行时开关借 `context.is_prefill`（decode 不启用）；首版限 `enforce_eager` | ✅ 完成，未测 |
+| B7 | 验收：TP=2+SP vs TP=2 greedy 逐 token 一致 + `torch.npu.memory_stats()` 激活内存对比 | ⏳ 需有卡 |
+
+**建议顺序**：B2 单测（本机可做，需临时改回 importlib）→ A3（有卡）→ B7（有卡）
+
+### B7 验收与调参思路（有卡执行）
+
+**第一步：正确性**
+
+- 两组都 `enforce_eager=True`、greedy 采样，否则对比的是"图 vs eager"而非"SP vs 无 SP"
+- 先跑 T 不被 tp_size 整除的 batch（如 batch 内 7 / 13 个 token），确认 `all_gather` 的 pad/截断路径；再跑整除 batch
+- 判据：TP=2 与 TP=2+SP 的输出 token ids 完全一致；不一致时按"embedding 切口 → Column gather → Row scatter → lm_head gather"顺序二分定位
+
+**第二步：峰值是否真的下降**
+
+- 分阶段测量：`reset_peak_memory_stats()` 后只跑一次 prefill，记录 `max_memory_allocated()`；decode 阶段单独测（SP 不参与）
+- SP 只缩小 shard 区（残差流 / RMSNorm 输出），attention 与 MLP 中间量仍在完整 T，不省
+- v1 的 `all_gather` 会临时分配 pad buffer + `cat` 结果（合计约 2×T×H），峰值可能被抵消——**这一步不降，后面调参没有意义**
+
+**第三步：省下的显存如何变现**
+
+- 固定 `gpu_memory_utilization`，比较引擎实际开出的 `num_kvcache_blocks`：块数增加 → decode 并发上限提高
+- 若显存允许，再调大 `max_num_batched_tokens`（原值可能正是被激活峰值卡住的），观察 TTFT 与 prefill 吞吐
+- 注意 SP 只是抬高天花板，参数不手动上调不会自动产生收益
+
+**第四步：扫参定位适用区**
+
+- 主变量 `max_num_batched_tokens`（4K/8K/16K/32K）× `tensor_parallel_size`（2/4/8），负载必须偏 prefill（长 prompt + 短输出），否则差异淹没在 decode 噪声里
+- 辅助变量 `max_num_seqs`（同样 T 下长序列少请求 vs 短序列多请求）、`kvcache_block_size`
+- 关注三条曲线：prefill 峰值差、TTFT 差、KV 块增量；只有"峰值降 + 块数增 + TTFT 不明显劣化"的组合才值得默认开启
+- 预期：v1 每层通信量约高于基线 50%（`all_reduce`×2 → `all_gather` + 模拟 `reduce_scatter`），TP 越大摊薄越多；TP=2 + 显存宽松时应无收益
+
+## 5. 测试要点（ut/test_parallel_state.py，曾全绿，现需有卡环境）
 
 - gloo + `mp.spawn`，六用例：(2,2)×2、(2,1)×2、(2,4)、(4,2)——非方阵用例防"公式只在 tp==cp 时碰巧对"
 - metadata 断言（用 `group_ranks` 现算预期，不硬编码）：
@@ -83,7 +155,14 @@
 5. 行/列索引混淆：行号语义是 cp_rank（`rank // tp_size`），列号是 tp_rank（`rank % tp_size`）——用 `divmod(rank, tp_size)` + 断言自检
 6. **`dist.gather` 的 dst 要全局 rank**（与 group 参数无关），封装层必须做 `group_ranks[dst]` 翻译
 7. `python ut/test_x.py` 直接执行时 sys.path 加的是**脚本所在目录**而非 cwd；`from nanovllm...` import 还会拖 `__init__.py` 的 torch_npu/torchair 链——纯 CPU 测试需 importlib bypass
-8. IDE 自动"删除未使用导入"可能误删刚加的 import（诊断延迟），留意 quick fix
+8. IDE 自动"删除未使用导入"可能误删刚加的 import（诊断延迟），留意 quick fix；同理，"确认采纳" old-code 建议会把已修好的代码写回旧版本，commit 前先 `git diff`
+9. **`all_gather` 的 `total` 不能从 `input_.shape[0]` 推**：进函数时 input 已是 shard（T/N 行），必须由调用方从 cu_seqlens 传入全网一致的 T
+10. **`reduce_scatter` 要 `.clone()`**：`tensor[start:end]` 是视图，底层仍持有完整 T×H 存储，会抵消 SP 的 activation 显存收益
+11. **`Context` 是位置参数构造**：给 dataclass 插字段后，`Context(is_prefill, cu_seqlens_q, ...)` 会整体后移错位（`cu_seqlens_q` 落进 `enable_sp`），类型不匹配时才会报错，兼容时静默错算。已全部改为关键字构造，后续新增字段务必保持
+12. **embedding 入口不要用 `reduce_scatter`**：`all_reduce`（词表维）与 token 切分正交，先切 `input_ids` 再保留原 `all_reduce`，通信/计算都只有 `1/N`；若改成"全量算完再 reduce_scatter"，要多算 `(N-1)/N` 的废活并抬高峰值
+13. **`reduce_scatter` 的输入侧不能裁**：通用场景（如 ZeRO 梯度）中每个 rank 必须贡献它对所有分块的 partial；SP 的 Row 出口之所以能"先切后算"，是因为切片维（token）与归约维（hidden）正交，这是 TP 结构给的局部特权，不能下沉为通用原语
+14. **特殊模型必须拦死**：多模态走 `inputs_embeds` 会绕过 `embed_tokens`（入口没切，下游却按 shard 处理）；MoE 的专家循环里 Column gather 后每个 rank 都算出相同 full T 结果，Row 的 all_reduce 会放大 N 倍。两者都在 `config.py` 断言拦截，v2 再谈支持
+15. **索引要区分"坐标系"与"地址"**：`cu_seqlens` / `last_indices` / `positions` 是坐标系，必须与张量同坐标系；`slot_mapping` / `block_tables` 是全局地址，条目顺序跟着同区间切即可。判据：`f(x_full)[s:e] == f(x_full[s:e], meta[s:e])`
 
 ## 7. 环境备忘
 

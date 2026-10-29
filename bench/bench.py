@@ -24,7 +24,7 @@ def main():
     args = EngineArgs.from_cli_args(args)
     logger.info(f"args: {args}")
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, max_num_seqs=args.max_num_seqs,
-              tensor_parallel_size=args.tensor_parallel_size, hccl_port=args.hccl_port)
+              tensor_parallel_size=args.tensor_parallel_size, enable_sp=args.enable_sp, hccl_port=args.hccl_port)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_output_len)) for _

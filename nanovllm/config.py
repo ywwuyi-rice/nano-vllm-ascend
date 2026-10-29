@@ -19,6 +19,7 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    enable_sp:bool = False
     enforce_eager: bool = True
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -37,6 +38,13 @@ class Config:
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=self.trust_remote_code)
+        if self.enable_sp:
+            assert self.tensor_parallel_size > 1
+            assert self.enforce_eager == True
+            arch = getattr(self.hf_config, "architectures", None) or []
+            assert not any("Moe" in a for a in arch), "SP does not support MoE models yet"
+            assert self.hf_config.model_type not in {"qwen3_vl", "qwen2_5_omni"}, \
+                "SP does not support multimodal models yet"
         #self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         # Multimodal models (e.g. Qwen3-VL) store the text settings in
         # hf_config.text_config.

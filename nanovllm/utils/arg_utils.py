@@ -14,12 +14,14 @@ class EngineArgs:
     dtype: str = "auto"
     seed: int = 0
     tensor_parallel_size: int = 1
+    enable_sp: bool = False
     block_size: int = 256
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 16
     enforce_eager: bool = True
     hccl_port: int = 3456
+
 
     def __post_init__(self):
         self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
@@ -42,6 +44,8 @@ class EngineArgs:
         parser.add_argument('--tensor-parallel-size', '-tp', type=int,
                             default=EngineArgs.tensor_parallel_size,
                             help='number of tensor parallel replicas')
+        parser.add_argument('--enable-sp','-sp', action='store_true',
+                            help='enable sequence parallel (prefill only)')
         # KV cache arguments
         parser.add_argument('--block-size', type=int,
                             default=EngineArgs.block_size,

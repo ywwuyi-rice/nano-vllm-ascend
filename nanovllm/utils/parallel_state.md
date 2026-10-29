@@ -168,12 +168,12 @@ torch 该接口无返回值、原地修改，封装返回 x 只是为了支持�
 
 细节：dst 是“组内 rank”，而 torch 的 dist.gather 要求“全局 rank”，所以需要 self.group_ranks[dst] 做一次翻译。size==1 时把 x 写进 gather_list[0]，履行“调用后 dst 的列表里有值”的契约，否则调用方会读到 empty 的垃圾值。用途：ParallelLMHead 收集各 rank 的 logits（只有 rank0 需要）。
 
-### 3. _token_range
+### 3. token_range
 
 SP 的 token 切分公式，纯本地计算、零通信：
 
 ```python
-    def _token_range(self, total_len: int) -> tuple[int, int]:
+    def token_range(self, total_len: int) -> tuple[int, int]:
         base, rem = divmod(total_len, self.size)
         start = self.rank * base + min(self.rank, rem)   # 把余数均分给前面的 rank
         end = start + base + (1 if self.rank < rem else 0)
@@ -193,7 +193,7 @@ SP 的 token 切分公式，纯本地计算、零通信：
         if self.size == 1:
             return input_
         self.all_reduce(input_)
-        start, end = self._token_range(input_.shape[0])
+        start, end = self.token_range(input_.shape[0])
         # clone：切片是 view，会拖住完整 T×H 存储，抵消 SP 的显存收益
         output_ = input_[start:end].clone()
         return output_
@@ -215,7 +215,7 @@ b. 必须 .clone()：切片是 view，底层仍引用完整的 T×H 存储，父
     def all_gather(self, input_: torch.Tensor, total_len: int) -> torch.Tensor:
         if self.size == 1:
             return input_
-        start, end = self._token_range(total_len)
+        start, end = self.token_range(total_len)
         base, rem = divmod(total_len, self.size)
         sizes = [base + 1 if r < rem else base for r in range(self.size)]
         max_len = base + (1 if rem else 0)
@@ -235,7 +235,7 @@ a. total_len 必须由调用方传入，绝不能从 input_.shape[0] 推：进�
 
 b. 只能尾部 pad，因为截断用的是 b[:s]，依赖多余数据在尾部。
 
-c. assert my_len == sizes[self.rank] 自检：验证 _token_range 与 sizes 两套推导一致。
+c. assert my_len == sizes[self.rank] 自检：验证 token_range 与 sizes 两套推导一致。
 
 通信量约等于 V（只多传不到 N 行），已接近理论下限。和 gather 的区别：gather 只有 dst 收，all_gather 是人人一份。
 

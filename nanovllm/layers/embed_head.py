@@ -32,6 +32,10 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        ctx = get_context()
+        if ctx.enable_sp and ctx.is_prefill:
+            start, end = get_tp_group().token_range(ctx.num_tokens)
+            x = x[start:end]
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)

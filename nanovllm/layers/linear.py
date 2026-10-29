@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from nanovllm.utils.parallel_state import get_tp_group
-
+from nanovllm.utils.context import get_context
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -71,6 +71,9 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ctx = get_context()
+        if ctx.enable_sp and ctx.is_prefill:
+            x = get_tp_group().all_gather(x,ctx.num_tokens)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -150,5 +153,9 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            get_tp_group().all_reduce(y)
+            ctx = get_context()
+            if ctx.enable_sp and ctx.is_prefill:
+                y = get_tp_group().reduce_scatter(y)
+            else:
+                get_tp_group().all_reduce(y) 
         return y

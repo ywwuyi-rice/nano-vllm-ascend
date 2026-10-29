@@ -25,7 +25,7 @@ class GroupCoordinator:
         dist.gather(input_,gather_list,self.group_ranks[dst],self.device_group)
         return input_
 
-    def _token_range(self,total_len:int) ->tuple[int,int]:
+    def token_range(self,total_len:int) ->tuple[int,int]:
         base ,rem = divmod(total_len, self.size)
         start = self.rank*base+min(self.rank,rem) #把余数均分给前面的rank
         end = start+base+(1 if self.rank < rem else 0)
@@ -35,7 +35,7 @@ class GroupCoordinator:
         if self.size == 1:
             return input_
         self.all_reduce(input_)
-        start,end = self._token_range(input_.shape[0])
+        start,end = self.token_range(input_.shape[0])
         # clone：切片是 view，会拖住完整 T×H 存储，抵消 SP 的显存收益
         output_ = input_[start:end].clone()
         return output_
@@ -44,7 +44,7 @@ class GroupCoordinator:
     def all_gather(self,input_:torch.Tensor,total_len:int) ->torch.Tensor:
         if self.size == 1:
             return input_
-        start,end = self._token_range(total_len)
+        start,end = self.token_range(total_len)
         base, rem = divmod(total_len,self.size)
         sizes = [base+1 if r< rem else base for r in range(self.size)]
         max_len = base+(1 if rem else 0)
